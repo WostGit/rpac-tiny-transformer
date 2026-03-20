@@ -1,0 +1,127 @@
+name: Tiny Transformer PAC Privacy CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - work
+  pull_request:
+
+jobs:
+  train-tiny-transformer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      VENV_DIR: ".venv"
+      ARTIFACT_DIR: "artifacts"
+      MEMORY_BUDGET_MB: "2500"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect workspace consistency
+        id: workspace_check
+        shell: bash
+        run: |
+          set +e
+          git rev-parse --is-inside-work-tree >/dev/null 2>&1
+          inside_repo=$?
+          git fsck --no-progress --strict >/dev/null 2>&1
+          fsck_ok=$?
+          set -e
+
+          if [[ "$inside_repo" -ne 0 || "$fsck_ok" -ne 0 ]]; then
+            echo "inconsistent=true" >> "$GITHUB_OUTPUT"
+            echo "Workspace inconsistency detected; triggering self-healing checkout."
+          else
+            echo "inconsistent=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Self-heal by re-cloning repository
+        if: steps.workspace_check.outputs.inconsistent == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}"
+          rm -rf repo-heal
+          git clone --depth 1 "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" repo-heal
+          rsync -a --delete --exclude '.git' repo-heal/ "${GITHUB_WORKSPACE}/"
+          cd "${GITHUB_WORKSPACE}"
+          git reset --hard "${GITHUB_SHA}" || true
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Build and repair virtual environment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rebuild_venv() {
+            rm -rf "$VENV_DIR"
+            python -m venv "$VENV_DIR"
+            source "$VENV_DIR/bin/activate"
+            python -m pip install --upgrade pip wheel setuptools
+          }
+
+          retry_install() {
+            source "$VENV_DIR/bin/activate"
+            for attempt in $(seq 1 10); do
+              echo "Install attempt ${attempt}/10"
+              if python -m pip install \
+                --index-url https://download.pytorch.org/whl/cpu \
+                torch && \
+                python -m pip install numpy matplotlib psutil; then
+                return 0
+              fi
+              sleep $((attempt * 2))
+            done
+            return 1
+          }
+
+          validate_imports() {
+            source "$VENV_DIR/bin/activate"
+            python - <<'PY'
+import importlib
+modules = ["torch", "numpy", "matplotlib", "psutil"]
+for name in modules:
+    importlib.import_module(name)
+print("import validation successful")
+PY
+          }
+
+          rebuild_venv
+          retry_install
+
+          if ! validate_imports; then
+            echo "Import validation failed. Wiping and rebuilding virtual environment."
+            rebuild_venv
+            retry_install
+            validate_imports
+          fi
+
+      - name: Run tiny transformer training + PAC controller
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$VENV_DIR/bin/activate"
+          mkdir -p "$ARTIFACT_DIR"
+          timeout 120s python scripts/train_tiny_pac.py \
+            --max-runtime-sec 110 \
+            --artifact-dir "$ARTIFACT_DIR" \
+            --memory-budget-mb "$MEMORY_BUDGET_MB"
+
+      - name: Upload training artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiny-transformer-pac-artifacts
+          path: artifacts/
+          if-no-files-found: warn
