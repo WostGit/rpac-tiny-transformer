@@ -1,0 +1,112 @@
+name: pac-tiny-transformer-ci
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+jobs:
+  train-with-pac-controller:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      PYTHON_VERSION: "3.10"
+      VENV_DIR: ".venv"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_NO_COLOR: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Self-heal workspace (re-clone when inconsistent)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            echo "Workspace is inconsistent: not a git work tree. Re-cloning."
+            rm -rf "${GITHUB_WORKSPACE:?}"/* "${GITHUB_WORKSPACE}/".[!.]* "${GITHUB_WORKSPACE}/"..?* || true
+            git clone --depth 1 "https://github.com/${GITHUB_REPOSITORY}.git" "${GITHUB_WORKSPACE}"
+            cd "${GITHUB_WORKSPACE}"
+          fi
+
+          if ! git cat-file -e "${GITHUB_SHA}^{commit}" >/dev/null 2>&1; then
+            echo "Workspace missing expected commit ${GITHUB_SHA}. Re-syncing from origin."
+            git fetch --depth 1 origin "${GITHUB_SHA}" || true
+            if ! git cat-file -e "${GITHUB_SHA}^{commit}" >/dev/null 2>&1; then
+              echo "Commit is still unavailable after fetch. Re-cloning repository."
+              rm -rf "${GITHUB_WORKSPACE:?}"/* "${GITHUB_WORKSPACE}/".[!.]* "${GITHUB_WORKSPACE}/"..?* || true
+              git clone --depth 1 "https://github.com/${GITHUB_REPOSITORY}.git" "${GITHUB_WORKSPACE}"
+              cd "${GITHUB_WORKSPACE}"
+            fi
+          fi
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Build virtualenv with retry + validation + self-repair
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          install_with_retries() {
+            local attempt=1
+            while [ "$attempt" -le 10 ]; do
+              echo "Install attempt ${attempt}/10"
+              if "${VENV_DIR}/bin/pip" install --upgrade pip setuptools wheel && \
+                 "${VENV_DIR}/bin/pip" install torch==2.2.2 numpy==1.26.4 psutil==5.9.8 pandas==2.2.2; then
+                return 0
+              fi
+              attempt=$((attempt + 1))
+              sleep $((attempt * 2))
+            done
+            return 1
+          }
+
+          validate_imports() {
+            "${VENV_DIR}/bin/python" -c 'import importlib; [importlib.import_module(m) for m in ["torch","numpy","psutil","pandas"]]; print("Import validation OK")'
+          }
+
+          python -m venv "${VENV_DIR}"
+          if ! install_with_retries; then
+            echo "Dependency installation failed after 10 attempts."
+            exit 1
+          fi
+
+          if ! validate_imports; then
+            echo "Import validation failed; wiping and rebuilding virtual environment."
+            rm -rf "${VENV_DIR}"
+            python -m venv "${VENV_DIR}"
+            if ! install_with_retries; then
+              echo "Dependency installation failed after rebuild."
+              exit 1
+            fi
+            if ! validate_imports; then
+              echo "Import validation failed after rebuild."
+              exit 1
+            fi
+          fi
+
+      - name: Run short CPU-only training with PAC privacy controller
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${VENV_DIR}/bin/python" scripts/ci_train.py
+
+      - name: Upload PAC artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pac-training-artifacts
+          path: |
+            artifacts/pac_bound.txt
+            artifacts/enforcement_log.json
+            artifacts/training_losses.csv
+            artifacts/memory_runtime.csv
+            artifacts/metrics.json
+          if-no-files-found: error
