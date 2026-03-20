@@ -1,0 +1,402 @@
+name: tiny-transformer-pac-ci
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  train-pac-tiny-transformer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      MAX_TRAIN_SECONDS: "110"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Self-heal workspace (re-clone if inconsistent)
+        shell: bash
+        run: |
+          set -euo pipefail
+          HEALTHY=1
+          if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            echo "[heal] Not inside a valid git work tree."
+            HEALTHY=0
+          fi
+          if ! git status --porcelain >/tmp/git-status.txt 2>/tmp/git-status.err; then
+            echo "[heal] git status failed:"
+            cat /tmp/git-status.err || true
+            HEALTHY=0
+          fi
+          if [ "$HEALTHY" -eq 0 ]; then
+            echo "[heal] Re-cloning repository to restore consistent workspace."
+            cd "$RUNNER_TEMP"
+            rm -rf healed_repo
+            git clone "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" healed_repo
+            cd healed_repo
+            git checkout "${GITHUB_SHA}"
+            shopt -s dotglob
+            rm -rf "$GITHUB_WORKSPACE"/*
+            cp -a . "$GITHUB_WORKSPACE"/
+            echo "[heal] Workspace restored from fresh clone."
+          else
+            echo "[heal] Workspace is healthy."
+          fi
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Build venv with retry + validation + self-repair
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          create_env() {
+            rm -rf .venv
+            python -m venv .venv
+            source .venv/bin/activate
+            python -m pip install --upgrade pip setuptools wheel
+          }
+
+          install_deps_with_retries() {
+            source .venv/bin/activate
+            local ok=0
+            for i in $(seq 1 10); do
+              echo "[deps] Attempt ${i}/10"
+              if pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+                "torch==2.5.1+cpu" numpy matplotlib psutil; then
+                ok=1
+                break
+              fi
+              echo "[deps] install failed; sleeping before retry"
+              sleep $((i * 2))
+            done
+            [ "$ok" -eq 1 ] || return 1
+          }
+
+          validate_imports() {
+            source .venv/bin/activate
+            python - <<'PY'
+import importlib
+mods = ["torch", "numpy", "matplotlib", "psutil"]
+for m in mods:
+    importlib.import_module(m)
+print("[deps] imports validated")
+PY
+          }
+
+          create_env
+          if ! install_deps_with_retries; then
+            echo "[deps] Initial installation failed after retries."
+            exit 1
+          fi
+
+          if ! validate_imports; then
+            echo "[deps] Validation failed; wiping and rebuilding environment."
+            create_env
+            install_deps_with_retries
+            validate_imports
+          fi
+
+      - name: Run tiny transformer training with PAC-style privacy controller
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          mkdir -p artifacts
+          cat > ci_train.py <<'PY'
+import csv
+import json
+import math
+import os
+import time
+from dataclasses import dataclass
+
+import matplotlib.pyplot as plt
+import numpy as np
+import psutil
+import torch
+import torch.nn as nn
+
+
+torch.set_num_threads(2)
+torch.manual_seed(7)
+np.random.seed(7)
+
+
+class TinyTransformer(nn.Module):
+    def __init__(self, vocab_size, seq_len, d_model, n_head, n_layers):
+        super().__init__()
+        self.token_emb = nn.Embedding(vocab_size, d_model)
+        self.pos_emb = nn.Parameter(torch.randn(1, seq_len, d_model) * 0.01)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_head,
+            dim_feedforward=d_model * 4,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
+        self.ln = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size)
+
+    def forward(self, x):
+        h = self.token_emb(x) + self.pos_emb[:, : x.size(1), :]
+        h = self.encoder(h)
+        h = self.ln(h)
+        return self.head(h)
+
+
+class PACPrivacyController:
+    def __init__(self, max_grad_norm=1.0, noise_multiplier=0.02):
+        self.max_grad_norm = max_grad_norm
+        self.noise_multiplier = noise_multiplier
+        self.enforcement_events = []
+
+    def enforce(self, model, step):
+        total_norm = torch.norm(
+            torch.stack([
+                p.grad.detach().norm(2)
+                for p in model.parameters()
+                if p.grad is not None
+            ]),
+            2,
+        )
+        if not torch.isfinite(total_norm):
+            raise FloatingPointError("Gradient norm became NaN/Inf before enforcement")
+
+        clipped = False
+        if total_norm.item() > self.max_grad_norm:
+            scale = self.max_grad_norm / (total_norm.item() + 1e-12)
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad.mul_(scale)
+            clipped = True
+
+        for p in model.parameters():
+            if p.grad is not None:
+                p.grad.add_(torch.randn_like(p.grad) * self.noise_multiplier * self.max_grad_norm)
+
+        self.enforcement_events.append(
+            {
+                "step": step,
+                "pre_clip_grad_norm": float(total_norm.item()),
+                "clipped": clipped,
+                "noise_multiplier": self.noise_multiplier,
+            }
+        )
+
+
+@dataclass
+class AttemptConfig:
+    d_model: int
+    n_head: int
+    n_layers: int
+    batch_size: int
+    seq_len: int
+    lr: float
+
+
+def count_params(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def compute_pac_bound(empirical_loss, n_samples, num_params, delta=0.1):
+    if n_samples <= 0 or num_params <= 0:
+        raise ValueError("Invalid inputs for PAC bound computation")
+    complexity = math.log(num_params + 1.0)
+    bound = empirical_loss + math.sqrt((complexity + math.log(2.0 / delta)) / (2.0 * n_samples))
+    if not math.isfinite(bound):
+        raise FloatingPointError("PAC bound is NaN/Inf")
+    return bound
+
+
+def get_mem_mb():
+    return psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+
+
+def synthetic_batch(batch_size, seq_len, vocab_size):
+    x = torch.randint(0, vocab_size, (batch_size, seq_len), dtype=torch.long)
+    y = torch.roll(x, shifts=-1, dims=1)
+    return x, y
+
+
+def run_attempt(cfg, max_seconds):
+    vocab_size = 256
+    max_steps = 40
+    model = TinyTransformer(vocab_size, cfg.seq_len, cfg.d_model, cfg.n_head, cfg.n_layers)
+    params = count_params(model)
+    if params < 1_000_000 or params > 10_000_000:
+        raise ValueError(f"Model size {params} is outside 1-10M parameters")
+
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
+    criterion = nn.CrossEntropyLoss()
+    controller = PACPrivacyController(max_grad_norm=1.0, noise_multiplier=0.02)
+
+    t0 = time.time()
+    losses = []
+    peak_mem = get_mem_mb()
+
+    for step in range(max_steps):
+        if time.time() - t0 > max_seconds:
+            break
+
+        if get_mem_mb() > 2200:
+            raise MemoryError("Memory pressure detected (>2200MB RSS)")
+
+        x, y = synthetic_batch(cfg.batch_size, cfg.seq_len, vocab_size)
+        logits = model(x)
+
+        if not torch.isfinite(logits).all():
+            raise FloatingPointError("Logits contain NaN/Inf")
+
+        loss = criterion(logits.reshape(-1, vocab_size), y.reshape(-1))
+        if not torch.isfinite(loss):
+            raise FloatingPointError("Loss became NaN/Inf")
+
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+
+        for p in model.parameters():
+            if p.grad is not None and not torch.isfinite(p.grad).all():
+                raise FloatingPointError("Gradient contains NaN/Inf")
+
+        controller.enforce(model, step)
+        opt.step()
+
+        loss_value = float(loss.item())
+        if not math.isfinite(loss_value):
+            raise FloatingPointError("Loss scalar became NaN/Inf")
+        losses.append(loss_value)
+        peak_mem = max(peak_mem, get_mem_mb())
+
+    if len(losses) == 0:
+        raise RuntimeError("No optimization steps were completed")
+
+    if controller.enforcement_events == []:
+        raise RuntimeError("Privacy controller did not activate")
+
+    if any(not math.isfinite(v) for v in losses):
+        raise FloatingPointError("Training diverged (non-finite losses)")
+
+    empirical_loss = float(np.mean(losses[-5:]))
+    bound = compute_pac_bound(empirical_loss, n_samples=len(losses) * cfg.batch_size, num_params=params)
+
+    return {
+        "losses": losses,
+        "bound": bound,
+        "events": controller.enforcement_events,
+        "runtime_sec": time.time() - t0,
+        "peak_mem_mb": peak_mem,
+        "params": params,
+        "steps": len(losses),
+        "config": cfg.__dict__,
+    }
+
+
+def main():
+    max_seconds = float(os.environ.get("MAX_TRAIN_SECONDS", "110"))
+    attempts = [
+        AttemptConfig(d_model=384, n_head=6, n_layers=4, batch_size=24, seq_len=96, lr=2e-3),
+        AttemptConfig(d_model=320, n_head=5, n_layers=4, batch_size=16, seq_len=80, lr=1.5e-3),
+        AttemptConfig(d_model=256, n_head=4, n_layers=3, batch_size=12, seq_len=64, lr=1e-3),
+    ]
+
+    errors = []
+    result = None
+
+    for i, cfg in enumerate(attempts, start=1):
+        try:
+            print(f"[attempt {i}] config={cfg}")
+            result = run_attempt(cfg, max_seconds=max_seconds)
+            print(f"[attempt {i}] success")
+            break
+        except Exception as exc:
+            msg = f"attempt {i} failed: {type(exc).__name__}: {exc}"
+            print(msg)
+            errors.append(msg)
+
+    if result is None:
+        raise RuntimeError(
+            "Model diverged or could not stabilize with safer hyperparameters. "
+            + " | ".join(errors)
+        )
+
+    os.makedirs("artifacts", exist_ok=True)
+
+    with open("artifacts/pac_bound.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "pac_style_bound": result["bound"],
+                "params": result["params"],
+                "steps": result["steps"],
+                "config": result["config"],
+            },
+            f,
+            indent=2,
+        )
+
+    with open("artifacts/enforcement_log.json", "w", encoding="utf-8") as f:
+        json.dump(result["events"], f, indent=2)
+
+    with open("artifacts/loss_curve.csv", "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["step", "loss"])
+        for i, loss in enumerate(result["losses"]):
+            writer.writerow([i, loss])
+
+    plt.figure(figsize=(6, 4))
+    plt.plot(result["losses"])
+    plt.xlabel("Step")
+    plt.ylabel("Loss")
+    plt.title("Tiny Transformer Training Loss")
+    plt.tight_layout()
+    plt.savefig("artifacts/loss_curve.png", dpi=140)
+
+    with open("artifacts/metrics.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "runtime_sec": result["runtime_sec"],
+                "peak_mem_mb": result["peak_mem_mb"],
+                "final_loss": result["losses"][-1],
+                "mean_last5_loss": float(np.mean(result["losses"][-5:])),
+            },
+            f,
+            indent=2,
+        )
+
+    if len(result["events"]) == 0:
+        raise RuntimeError("FAIL: privacy controller did not activate")
+    if not math.isfinite(result["bound"]):
+        raise RuntimeError("FAIL: bound could not be computed")
+
+    print("[ok] PAC-style bound:", result["bound"])
+
+
+if __name__ == "__main__":
+    main()
+PY
+
+          python ci_train.py
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiny-transformer-pac-artifacts
+          path: |
+            artifacts/pac_bound.json
+            artifacts/enforcement_log.json
+            artifacts/loss_curve.csv
+            artifacts/loss_curve.png
+            artifacts/metrics.json
+          if-no-files-found: error
