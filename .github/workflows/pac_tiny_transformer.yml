@@ -1,0 +1,104 @@
+name: Tiny Transformer PAC Privacy CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  train-with-pac-controller:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Self-heal workspace consistency
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            echo "Workspace is not a valid git tree. Re-cloning..."
+          elif ! git fsck --no-progress >/tmp/git-fsck.log 2>&1; then
+            echo "git fsck failed. Re-cloning workspace..."
+            cat /tmp/git-fsck.log
+          else
+            echo "Workspace consistency check passed."
+            exit 0
+          fi
+
+          tmpdir="${RUNNER_TEMP}/repo-heal"
+          rm -rf "$tmpdir"
+          git clone --depth 1 \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "$tmpdir"
+          rsync -a --delete "$tmpdir/" "$GITHUB_WORKSPACE/"
+          cd "$GITHUB_WORKSPACE"
+          git rev-parse --is-inside-work-tree >/dev/null
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Build virtualenv with self-repair and import validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .venv
+          python -m venv .venv
+          source .venv/bin/activate
+          python -m pip install --upgrade pip setuptools wheel
+
+          install_ok=0
+          for attempt in $(seq 1 10); do
+            echo "Dependency install attempt ${attempt}/10"
+            if python -m pip install --retries 3 --timeout 120 \
+              --index-url https://download.pytorch.org/whl/cpu \
+              torch==2.5.1+cpu && \
+               python -m pip install numpy==1.26.4 psutil==6.1.1 matplotlib==3.9.2; then
+              install_ok=1
+              break
+            fi
+            sleep 5
+          done
+
+          if [ "$install_ok" -ne 1 ]; then
+            echo "ERROR: Dependency installation failed after 10 attempts."
+            exit 1
+          fi
+
+          validate_imports() {
+            python -c 'import importlib; [importlib.import_module(m) for m in ["torch","numpy","psutil","matplotlib"]]; print("Import validation OK")'
+          }
+
+          if ! validate_imports; then
+            echo "Import validation failed. Wiping and rebuilding virtual environment..."
+            deactivate || true
+            rm -rf .venv
+            python -m venv .venv
+            source .venv/bin/activate
+            python -m pip install --upgrade pip setuptools wheel
+            python -m pip install --index-url https://download.pytorch.org/whl/cpu torch==2.5.1+cpu
+            python -m pip install numpy==1.26.4 psutil==6.1.1 matplotlib==3.9.2
+            validate_imports
+          fi
+
+      - name: Tiny transformer PAC training smoke run (<=2 min)
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          python ci/pac_tiny_transformer_smoke.py
+
+      - name: Upload training artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pac-tiny-transformer-artifacts
+          path: artifacts/
+          if-no-files-found: error
